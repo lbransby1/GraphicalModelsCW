@@ -1,0 +1,461 @@
+# ============================================================
+# 3.1.1
+# ============================================================
+
+import numpy as np
+
+# Settings 
+
+N = 10
+BETAS = (4.0, 1.0, 0.01)
+
+DECIMALS = 6
+VERBOSE = False   # True prints marginals + total, False prints just the matrix
+
+# Formatting (fixed-point, no scientific notation)
+
+def arr_str_fixed(a, decimals=6):
+    return np.array2string(
+        np.asarray(a, dtype=float),
+        formatter={"float_kind": lambda x: f"{x:.{decimals}f}"},
+    )
+
+def print_joint_short(beta, label, Q, decimals=6):
+    print(f"\nβ = {beta}  {label}")
+    print(arr_str_fixed(Q, decimals))
+
+def print_joint_verbose(beta, label, Q, decimals=10):
+    q_top = Q.sum(axis=1)
+    q_bottom = Q.sum(axis=0)
+    print(f"\nβ = {beta}  {label}")
+    print(f"q_top    = {arr_str_fixed(q_top, decimals)}")
+    print(f"q_bottom = {arr_str_fixed(q_bottom, decimals)}")
+    print("Q =")
+    print(arr_str_fixed(Q, decimals))
+    print(f"total = {Q.sum():.{decimals}f}")
+
+
+# Exact inference by column grouping (sum–product on chain)
+
+def exact_joint_top_bottom_rightcol(n=10, betas=(4.0, 1.0, 0.01)):
+    """
+    Exact inference for n×n grid with pairwise potential:
+        phi(x_u, x_v) = exp(beta * I[x_u = x_v]),
+    with spins x ∈ {-1, +1}.
+
+    Column grouping: each column is a giant variable Y_t with 2^n states.
+    Potentials:
+      Φ(y)  = exp(beta * (# vertical equalities within the column))
+      Ψ(y,y') = exp(beta * (# horizontal equalities between columns))
+
+    We run forward sum–product across n columns to get P(Y_n = y),
+    then aggregate into the 2×2 table of (x_{1,n}, x_{n,n}) in order [-1,+1].
+    """
+    ncols = n
+    S = 1 << n  # number of column states
+
+    states = np.arange(S, dtype=np.uint16)
+
+    # bits[state, r] ∈ {0,1} for row r (0=top)
+    bits01 = ((states[:, None] >> np.arange(n)) & 1).astype(np.uint8)
+
+    # map {0,1} -> {-1,+1}
+    spins = (2 * bits01 - 1).astype(np.int8)  # shape (S,n)
+
+    # count vertical equalities in each column state y:
+    # sum_{r=0..n-2} I[x_r == x_{r+1}]
+    vert_eq = (spins[:, :-1] == spins[:, 1:]).sum(axis=1).astype(np.int16)  # (S,)
+
+    # horizontal equalities between two column states y,y':
+    # sum_{r=0..n-1} I[x_r == x'_r]
+    # Use XOR popcount on bits01: same = n - popcount(y XOR y')
+    popcnt = np.array([int(i).bit_count() for i in range(S)], dtype=np.uint8)
+    xor = (states[:, None] ^ states[None, :]).astype(np.uint16)            # (S,S)
+    horiz_eq = (n - popcnt[xor]).astype(np.int16)                          # (S,S)
+
+    # indices for nodes of interest in last column:
+    # top-right is row 0, bottom-right is row n-1
+    top_spin = spins[:, 0]       # ∈ {-1,+1}
+    bottom_spin = spins[:, n-1]  # ∈ {-1,+1}
+
+    results = {}
+
+    for beta in betas:
+        # induced potentials
+        Phi = np.exp(beta * vert_eq).astype(np.float64)      # (S,)
+        Psi = np.exp(beta * horiz_eq).astype(np.float64)     # (S,S)
+
+        # forward sum-product across columns (messages)
+        # alpha_1(y) ∝ Φ(y)
+        alpha = Phi.copy()
+        alpha /= alpha.sum()
+
+        # for columns 2..ncols:
+        # alpha_new(y) ∝ Φ(y) * sum_{y_prev} alpha_prev(y_prev) Ψ(y_prev,y)
+        for _ in range(2, ncols + 1):
+            msg = alpha @ Psi          # (S,)
+            alpha = Phi * msg
+            alpha /= alpha.sum()
+
+        pY_last = alpha / alpha.sum()
+
+        # aggregate to 2×2 for (x_{1,n}, x_{n,n}) in order [-1,+1]
+        Q = np.zeros((2, 2), dtype=np.float64)
+        # map spin -> index
+        ti = (top_spin == +1).astype(np.int8)     # -1->0, +1->1 after this trick
+        bi = (bottom_spin == +1).astype(np.int8)
+
+        # accumulate probabilities
+        # row index = ti, col index = bi, but order [-1,+1] means:
+        # index 0 corresponds to -1, index 1 corresponds to +1
+        np.add.at(Q, (ti, bi), pY_last)
+
+        results[beta] = Q
+
+    return results
+
+
+# Main run for Q3.1.1
+
+if __name__ == "__main__":
+    tables = exact_joint_top_bottom_rightcol(n=N, betas=BETAS)
+
+    for beta in BETAS:
+        Q = tables[beta]
+        if VERBOSE:
+            print_joint_verbose(beta, "Exact inference (column grouping)", Q, decimals=10)
+        else:
+            print_joint_short(beta, "Exact inference (column grouping)", Q, decimals=DECIMALS)
+
+
+
+# ============================================================
+# 3.1.2
+# ============================================================
+import numpy as np
+import math
+
+# Settings
+
+N = 10
+BETAS = (4.0, 1.0, 0.01)
+
+EPS = 1e-10
+T_SWEEPS = 20000
+BIAS = 0.01
+SEED = 0
+RANDOM_INIT = False
+
+DECIMALS = 6
+VERBOSE = False   # True prints marginals + total, False prints just the matrix
+
+
+# Formatting (fixed-point, no scientific notation)
+
+def arr_str_fixed(a, decimals=6):
+    return np.array2string(
+        np.asarray(a, dtype=float),
+        formatter={"float_kind": lambda x: f"{x:.{decimals}f}"},
+    )
+
+def print_joint_short(beta, label, Q, decimals=6):
+    print(f"\nβ = {beta}  {label}")
+    print(arr_str_fixed(Q, decimals))
+
+def print_joint_verbose(beta, label, Q, decimals=10):
+    q_top = Q.sum(axis=1)
+    q_bottom = Q.sum(axis=0)
+    print(f"\nβ = {beta}  {label}")
+    print(f"q_top    = {arr_str_fixed(q_top, decimals)}")
+    print(f"q_bottom = {arr_str_fixed(q_bottom, decimals)}")
+    print("Q =")
+    print(arr_str_fixed(Q, decimals))
+    print(f"total = {Q.sum():.{decimals}f}")
+
+
+# Mean-field coordinate ascent
+
+def mean_field_coordinate_ascent(n=10, beta=1.0, eps=1e-10, T=20000,
+                                 init_m=0.01, random_init=False, seed=0):
+    """
+    Mean-field coordinate ascent (Gauss–Seidel) for spins x ∈ {-1,+1}.
+    Update: m_u <- tanh( (beta/2) * sum_{v in N(u)} m_v )
+    """
+    rng = np.random.default_rng(seed)
+
+    if random_init:
+        m = rng.uniform(-abs(init_m), abs(init_m), size=(n, n)).astype(np.float64)
+    else:
+        m = np.full((n, n), float(init_m), dtype=np.float64)
+
+    def neighbours(r, c):
+        if r > 0:     yield (r - 1, c)
+        if r < n - 1: yield (r + 1, c)
+        if c > 0:     yield (r, c - 1)
+        if c < n - 1: yield (r, c + 1)
+
+    for _ in range(T):
+        max_change = 0.0
+        for r in range(n):
+            for c in range(n):
+                s = 0.0
+                for rr, cc in neighbours(r, c):
+                    s += m[rr, cc]
+                h = (beta / 2.0) * s
+                new_m = math.tanh(h)
+                max_change = max(max_change, abs(new_m - m[r, c]))
+                m[r, c] = new_m
+        if max_change < eps:
+            break
+
+    q_plus  = (1.0 + m) / 2.0
+    q_minus = (1.0 - m) / 2.0
+    return m, q_plus, q_minus
+
+
+def joint_table_and_marginals(n=10, beta=1.0, eps=1e-10, T=20000,
+                              init_m=0.01, random_init=False, seed=0,
+                              renormalise=True):
+    """
+    Returns:
+      Q  : 2x2 joint for (x_{1,n}, x_{n,n}) with rows/cols ordered [-1,+1]
+      qT : marginal of x_{1,n} in [-1,+1]
+      qB : marginal of x_{n,n} in [-1,+1]
+    """
+    m, q_plus, q_minus = mean_field_coordinate_ascent(
+        n=n, beta=beta, eps=eps, T=T, init_m=init_m,
+        random_init=random_init, seed=seed
+    )
+
+    # nodes: top-right (0,n-1), bottom-right (n-1,n-1)
+    qT = np.array([q_minus[0, n-1],     q_plus[0, n-1]],     dtype=np.float64)  # [-1,+1]
+    qB = np.array([q_minus[n-1, n-1],   q_plus[n-1, n-1]],   dtype=np.float64)  # [-1,+1]
+
+    Q = np.outer(qT, qB)
+
+    if renormalise:
+        Q /= Q.sum()
+        qT = Q.sum(axis=1)
+        qB = Q.sum(axis=0)
+
+    return Q, qT, qB
+
+
+def symmetrised_mean_field(n=10, beta=1.0, eps=1e-10, T=20000,
+                           bias=0.01, random_init=False, seed=0):
+    """
+    Run mean-field twice (+bias and -bias) and average:
+      Q~ = 0.5*(Q(+) + Q(-))
+    """
+    Qp, qTp, qBp = joint_table_and_marginals(
+        n=n, beta=beta, eps=eps, T=T, init_m=+abs(bias),
+        random_init=random_init, seed=seed, renormalise=True
+    )
+    Qn, qTn, qBn = joint_table_and_marginals(
+        n=n, beta=beta, eps=eps, T=T, init_m=-abs(bias),
+        random_init=random_init, seed=seed, renormalise=True
+    )
+
+    Qavg = 0.5 * (Qp + Qn)
+    Qavg /= Qavg.sum()
+    qTavg = Qavg.sum(axis=1)
+    qBavg = Qavg.sum(axis=0)
+
+    return (Qp, qTp, qBp), (Qn, qTn, qBn), (Qavg, qTavg, qBavg)
+
+
+# Main run for Q3.1.2
+
+if __name__ == "__main__":
+    for beta in BETAS:
+        (Qp, qTp, qBp), (Qn, qTn, qBn), (Qavg, qTavg, qBavg) = symmetrised_mean_field(
+            n=N, beta=beta, eps=EPS, T=T_SWEEPS, bias=BIAS, random_init=RANDOM_INIT, seed=SEED
+        )
+
+        if VERBOSE:
+            print_joint_verbose(beta, "+init mean-field  Q(+)", Qp, decimals=10)
+            print_joint_verbose(beta, "-init mean-field  Q(-)", Qn, decimals=10)
+            print_joint_verbose(beta, "Symmetrised mean-field  Q~", Qavg, decimals=10)
+        else:
+            print_joint_short(beta, "+init mean-field  Q(+)", Qp, decimals=DECIMALS)
+            print_joint_short(beta, "-init mean-field  Q(-)", Qn, decimals=DECIMALS)
+            print_joint_short(beta, "Symmetrised mean-field  Q~", Qavg, decimals=DECIMALS)
+
+
+
+# ============================================================
+# 3.1.3
+# ============================================================
+
+import numpy as np
+import math
+
+
+# Settings 
+
+N = 10
+BETAS = (0.01, 1.0, 4.0)
+
+BURN_IN_SWEEPS = 10_000
+SAMPLE_SWEEPS  = 80_000
+THIN           = 10
+
+SEED_RANDOM = 1
+
+RANDOM_ORDER_EACH_SWEEP = True   # pseudocode allows random scan or fixed scan
+DECIMALS = 6                     # print precision
+VERBOSE = False                  # set True for marginals / extra info
+
+
+# Formatting (fixed-point, no scientific notation)
+
+def arr_str_fixed(a, decimals=6):
+    return np.array2string(
+        np.asarray(a, dtype=float),
+        formatter={"float_kind": lambda x: f"{x:.{decimals}f}"},
+    )
+
+def print_joint_short(beta, label, Q, kept=None, decimals=6):
+    kept_str = f" (kept={kept})" if kept is not None else ""
+    print(f"\nβ = {beta}  {label}{kept_str}")
+    print(arr_str_fixed(Q, decimals))
+
+def print_joint_verbose(beta, label, Q, kept=None, decimals=10):
+    q_top = Q.sum(axis=1)
+    q_bottom = Q.sum(axis=0)
+    kept_str = f", kept={kept}" if kept is not None else ""
+    print(f"\nβ = {beta}  {label}{kept_str}")
+    print(f"q_top    = {arr_str_fixed(q_top, decimals)}")
+    print(f"q_bottom = {arr_str_fixed(q_bottom, decimals)}")
+    print("Q =")
+    print(arr_str_fixed(Q, decimals))
+    print(f"total = {Q.sum():.{decimals}f}")
+
+
+# Stable sigmoid + symmetrisation
+
+def sigmoid(z: float) -> float:
+    if z >= 0:
+        ez = math.exp(-z)
+        return 1.0 / (1.0 + ez)
+    else:
+        ez = math.exp(z)
+        return ez / (1.0 + ez)
+
+def symmetrise_joint(Q: np.ndarray) -> np.ndarray:
+    """
+    Enforce global flip symmetry:
+      P(--)=P(++), P(-+)=P(+-)
+    """
+    diag = 0.5 * (Q[0, 0] + Q[1, 1])
+    off  = 0.5 * (Q[0, 1] + Q[1, 0])
+    Qs = np.array([[diag, off],
+                   [off,  diag]], dtype=float)
+    Qs /= Qs.sum()
+    return Qs
+
+
+# Single-site Gibbs sampler (matches pseudocode)
+
+def gibbs_spins_joint(
+    n=10,
+    beta=1.0,
+    burn_in_sweeps=10_000,
+    sample_sweeps=80_000,
+    thin=10,
+    seed=1,
+    init="random",                 # "random", "plus", "minus"
+    random_order_each_sweep=True
+):
+    """
+    Gibbs sampler for x in {-1,+1} with potentials exp(beta * I[xu=xv]).
+
+    Conditional:
+      P(x_{r,c}=+1 | rest) = sigmoid(beta * S)
+      S = sum of neighbour spins.
+
+    Returns:
+      joint (2x2) layout [[--, -+],[+-, ++]]
+      counts (2x2)
+      kept (int)
+    """
+    rng = np.random.default_rng(seed)
+
+    # init state
+    if init == "random":
+        x = rng.choice([-1, +1], size=(n, n)).astype(np.int8)
+    elif init == "plus":
+        x = np.ones((n, n), dtype=np.int8)
+    elif init == "minus":
+        x = -np.ones((n, n), dtype=np.int8)
+    else:
+        raise ValueError("init must be 'random', 'plus', or 'minus'")
+
+    # neighbours list
+    neigh = [[[] for _ in range(n)] for __ in range(n)]
+    for r in range(n):
+        for c in range(n):
+            if r > 0:     neigh[r][c].append((r - 1, c))
+            if r < n - 1: neigh[r][c].append((r + 1, c))
+            if c > 0:     neigh[r][c].append((r, c - 1))
+            if c < n - 1: neigh[r][c].append((r, c + 1))
+
+    counts = np.zeros((2, 2), dtype=np.int64)
+    kept = 0
+
+    all_sites = [(r, c) for r in range(n) for c in range(n)]
+    total_sweeps = burn_in_sweeps + sample_sweeps
+
+    for sweep in range(1, total_sweeps + 1):
+        # update order
+        if random_order_each_sweep:
+            order = rng.permutation(len(all_sites))
+            sites_iter = (all_sites[i] for i in order)
+        else:
+            sites_iter = all_sites
+
+        # sweep: update every site once
+        for (r, c) in sites_iter:
+            S = 0
+            for (rr, cc) in neigh[r][c]:
+                S += int(x[rr, cc])
+
+            p_plus = sigmoid(beta * S)
+            x[r, c] = +1 if (rng.random() < p_plus) else -1
+
+        # record with thinning
+        if sweep > burn_in_sweeps and ((sweep - burn_in_sweeps) % thin == 0):
+            a = int(x[0, n - 1])       # x_{1,n}
+            b = int(x[n - 1, n - 1])   # x_{n,n}
+            i = 0 if a == -1 else 1
+            j = 0 if b == -1 else 1
+            counts[i, j] += 1
+            kept += 1
+
+    joint = counts / counts.sum()
+    return joint, counts, kept
+
+
+# Main run for Q3.1.3
+
+if __name__ == "__main__":
+    for beta in BETAS:
+        Q_rand, _, kept = gibbs_spins_joint(
+            n=N,
+            beta=beta,
+            burn_in_sweeps=BURN_IN_SWEEPS,
+            sample_sweeps=SAMPLE_SWEEPS,
+            thin=THIN,
+            seed=SEED_RANDOM,
+            init="random",
+            random_order_each_sweep=RANDOM_ORDER_EACH_SWEEP
+        )
+        Q_sym = symmetrise_joint(Q_rand)
+
+        if VERBOSE:
+            print_joint_verbose(beta, "Gibbs (random init)", Q_rand, kept=kept, decimals=10)
+            print_joint_verbose(beta, "Symmetrised", Q_sym, kept=kept, decimals=10)
+        else:
+            print_joint_short(beta, "Gibbs (random init)", Q_rand, kept=kept, decimals=DECIMALS)
+            print_joint_short(beta, "Symmetrised", Q_sym, kept=kept, decimals=DECIMALS)
+
